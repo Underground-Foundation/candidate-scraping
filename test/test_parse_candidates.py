@@ -135,7 +135,8 @@ class ParseCouncilTest(unittest.TestCase):
         with contextlib.redirect_stderr(stderr):
             records = parse_candidates.parse_council_table(table, "Somewhere")
         self.assertEqual(records, [{"Electorate": "Somewhere", "Candidate": "Only Cell",
-                                    "Party": "Labor", "House": "Legislative Council"}])
+                                    "Party": "Labor", "House": "Legislative Council",
+                                    "URL": ""}])
         self.assertIn("1 candidate cells under 2 party headers", stderr.getvalue())
 
     def test_every_row_is_in_the_council(self):
@@ -168,6 +169,56 @@ class AsteriskTest(unittest.TestCase):
         ])
 
 
+class UrlTest(unittest.TestCase):
+    PAGE = """
+        <table>
+          <tr><th>Electorate</th><th>Held by</th><th>Labor candidate</th>
+              <th>Other candidates</th></tr>
+          <tr><td>Kew</td><td>Liberal</td>
+            <td><b><a href="./Jane_Doe">Jane Doe</a></b>*<sup class="reference"><a
+                href="#cite_note-1">[1]</a></sup></td>
+            <td>Ann Lee (<a href="./Independent_politician">Ind</a>)<sup class="reference"><a
+                href="#cite_note-1">[1]</a></sup><sup class="reference"><a
+                href="#cite_note-2">[2]</a></sup><br/>
+              Bob Ray (L)<br/>
+              Cy Young (FF)<sup class="reference"><a href="#cite_note-3">[3]</a></sup></td>
+          </tr>
+        </table>
+        <ol class="references">
+          <li id="cite_note-1"><span class="mw-cite-backlink"><a href="#cite_ref-1">^</a></span>
+            <span class="reference-text">A note with no link.</span></li>
+          <li id="cite_note-2"><span class="mw-cite-backlink"><a href="#cite_ref-2">^</a></span>
+            <span class="reference-text"><a class="external text"
+              href="https://example.com/ann">Ann Lee for Kew</a></span></li>
+          <li id="cite_note-3"><span class="reference-text"><a class="external text"
+              href="//example.com/cy">Cy</a></span></li>
+        </ol>"""
+
+    def setUp(self):
+        soup = BeautifulSoup(self.PAGE, "html.parser")
+        records = parse_candidates.parse_table(soup.find("table"))
+        self.urls = {r["Candidate"]: r["URL"] for r in records}
+
+    def test_linked_name_beats_reference(self):
+        self.assertEqual(self.urls["Jane Doe"], "https://en.wikipedia.org/wiki/Jane_Doe")
+
+    def test_reference_used_when_name_not_linked_and_party_link_ignored(self):
+        # The first footnote has no link, so the second is used.
+        self.assertEqual(self.urls["Ann Lee"], "https://example.com/ann")
+
+    def test_protocol_relative_reference(self):
+        self.assertEqual(self.urls["Cy Young"], "https://example.com/cy")
+
+    def test_no_link_or_reference(self):
+        self.assertEqual(self.urls["Bob Ray"], "")
+
+    def test_sample_page_reference_url(self):
+        soup = BeautifulSoup(SAMPLE_PAGE.read_text(encoding="utf-8"), "html.parser")
+        records = parse_candidates.parse_table(parse_candidates.find_assembly_table(soup))
+        urls = {r["Candidate"]: r["URL"] for r in records if r["Electorate"] == "Albert Park"}
+        self.assertEqual(urls["Sonya Semmens"], "https://greens.org.au/vic/person/sonya-semmens")
+
+
 class MainTest(unittest.TestCase):
     def test_writes_csv(self):
         with tempfile.TemporaryDirectory() as tmp:
@@ -178,13 +229,16 @@ class MainTest(unittest.TestCase):
             with output.open(newline="", encoding="utf-8") as f:
                 reader = csv.DictReader(f)
                 rows = list(reader)
-            self.assertEqual(reader.fieldnames, ["Electorate", "Candidate", "Party", "House"])
+            self.assertEqual(reader.fieldnames,
+                             ["Electorate", "Candidate", "Party", "House", "URL"])
             self.assertEqual(len(rows), 543 + 96)
             self.assertEqual(rows[0], {"Electorate": "Albert Park", "Candidate": "Nina Taylor",
-                                       "Party": "Labor", "House": "Legislative Assembly"})
+                                       "Party": "Labor", "House": "Legislative Assembly",
+                                       "URL": "https://en.wikipedia.org/wiki/Nina_Taylor"})
             self.assertEqual(rows[543], {"Electorate": "Eastern Victoria",
                                          "Candidate": "Renee Heath", "Party": "Coalition",
-                                         "House": "Legislative Council"})
+                                         "House": "Legislative Council",
+                                         "URL": "https://en.wikipedia.org/wiki/Renee_Heath"})
 
 
 if __name__ == "__main__":

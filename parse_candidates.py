@@ -2,25 +2,34 @@
 """Parse the Legislative Assembly and Legislative Council candidate tables from a saved
 Wikipedia page into a CSV.
 
-Output has one row per candidate, with columns Electorate, Candidate, Party, House.
+Output has one row per candidate, with columns Electorate, Candidate, Party, House, URL.
+The URL is the candidate's own link (usually their Wikipedia article) if their name is
+linked, otherwise the first web link in a footnote attached to their name, otherwise blank.
 """
 
 import argparse
 import csv
 import re
 import sys
+from dataclasses import dataclass, field
 from pathlib import Path
+from urllib.parse import urljoin
 
-from bs4 import BeautifulSoup, Tag
+from bs4 import BeautifulSoup, NavigableString, Tag
 
 DEFAULT_INPUT = "Candidates of the 2026 Victorian state election - Wikipedia.html"
 DEFAULT_OUTPUT = "candidates.csv"
+
+FIELDNAMES = ["Electorate", "Candidate", "Party", "House", "URL"]
+# Base for resolving relative wiki links such as "./Nina_Taylor".
+WIKI_BASE = "https://en.wikipedia.org/wiki/"
 
 ASSEMBLY = "Legislative Assembly"
 COUNCIL = "Legislative Council"
 
 # Abbreviations used in brackets after a candidate's name, e.g. "Andrew Cook (L)".
 PARTY_ABBREVIATIONS = {
+    "ACP": "Australian Citizens Party",
     "AJP": "Animal Justice",
     "FF": "Family First",
     "Ind": "Independent",
@@ -74,17 +83,98 @@ def column_party(header: Tag) -> str:
     return PARTY_ABBREVIATIONS.get(party, party)
 
 
-def cell_lines(cell: Tag) -> list[str]:
-    """Text of a cell split on <br> and <li>, with footnote markers and the asterisks that
-    mark successful candidates removed."""
-    for sup in cell.find_all("sup"):
-        sup.decompose()
-    for br in cell.find_all("br"):
-        br.replace_with("\n")
-    for li in cell.find_all("li"):
-        li.append("\n")
-    text = cell.get_text().replace("*", "")
-    return [" ".join(line.split()) for line in text.split("\n") if line.strip()]
+@dataclass
+class Line:
+    """One candidate's line within a cell, with the links and footnotes that appear on it."""
+    text: str = ""
+    links: list[Tag] = field(default_factory=list)
+    refs: list[Tag] = field(default_factory=list)
+
+
+def clean_text(text: str) -> str:
+    """Collapse whitespace and remove the asterisks that mark successful candidates."""
+    return " ".join(text.replace("*", "").split())
+
+
+def cell_lines(cell: Tag) -> list[Line]:
+    """A cell's lines, split on <br> and <li>. Footnote markers are left out of the text but
+    kept in `refs`; links (other than footnote markers) are kept in `links`."""
+    lines = [Line()]
+
+    def new_line() -> None:
+        if lines[-1].text.strip() or lines[-1].links or lines[-1].refs:
+            lines.append(Line())
+
+    def walk(node: Tag) -> None:
+        for child in node.children:
+            if type(child) is NavigableString:  # skips comments, <style> contents etc.
+                parts = str(child).split("\n")
+                lines[-1].text += parts[0]
+                for part in parts[1:]:
+                    new_line()
+                    lines[-1].text += part
+            elif not isinstance(child, Tag) or child.name in ("style", "script"):
+                continue
+            elif child.name == "sup":
+                if "reference" in (child.get("class") or []):
+                    lines[-1].refs.append(child)
+            elif child.name == "br":
+                new_line()
+            elif child.name == "li":
+                new_line()
+                walk(child)
+                new_line()
+            else:
+                if child.name == "a":
+                    lines[-1].links.append(child)
+                walk(child)
+
+    walk(cell)
+    result = []
+    for line in lines:
+        line.text = clean_text(line.text)
+        if line.text:
+            result.append(line)
+    return result
+
+
+def document_root(tag: Tag) -> Tag:
+    while tag.parent is not None:
+        tag = tag.parent
+    return tag
+
+
+def name_link_url(line: Line, name: str) -> str:
+    """URL of a link whose text is the candidate's name (not, say, a party abbreviation)."""
+    for link in line.links:
+        href = link.get("href", "")
+        if href and not href.startswith("#") and clean_text(link.get_text()) == name:
+            return urljoin(WIKI_BASE, href)
+    return ""
+
+
+def reference_url(sup: Tag) -> str:
+    """First web link in the footnote that a footnote marker like "[71]" points to."""
+    anchor = sup.find("a", href=True)
+    if anchor is None or not anchor["href"].startswith("#"):
+        return ""
+    note = document_root(sup).find(id=anchor["href"][1:])
+    if note is None:
+        return ""
+    body = note.find(class_="reference-text") or note
+    for link in body.find_all("a", href=True):
+        if link["href"].startswith(("http://", "https://", "//")):
+            return urljoin("https:", link["href"])
+    return ""
+
+
+def candidate_url(line: Line, name: str) -> str:
+    url = name_link_url(line, name)
+    for sup in line.refs:
+        if url:
+            break
+        url = reference_url(sup)
+    return url
 
 
 def resolve_party(abbreviation: str | None, default: str, electorate: str, line: str) -> str:
@@ -97,10 +187,11 @@ def resolve_party(abbreviation: str | None, default: str, electorate: str, line:
     return abbreviation
 
 
-def parse_candidate_line(line: str, default_party: str, electorate: str, house: str) -> dict:
-    match = CANDIDATE_RE.match(line)
-    party = resolve_party(match["party"], default_party, electorate, line)
-    return {"Electorate": electorate, "Candidate": match["name"], "Party": party, "House": house}
+def parse_candidate_line(line: Line, default_party: str, electorate: str, house: str) -> dict:
+    match = CANDIDATE_RE.match(line.text)
+    party = resolve_party(match["party"], default_party, electorate, line.text)
+    return {"Electorate": electorate, "Candidate": match["name"], "Party": party, "House": house,
+            "URL": candidate_url(line, match["name"])}
 
 
 def parse_table(table: Tag) -> list[dict]:
@@ -157,10 +248,17 @@ def parse_council_tables(soup: BeautifulSoup) -> list[dict]:
 
 def drop_partyless_duplicates(records: list[dict]) -> list[dict]:
     """Drop a party-less entry when the same person is also listed with a party in that
-    electorate (e.g. Mornington lists "Adrian Maher" and "Adrian Maher (Ind)")."""
-    with_party = {(r["Electorate"], r["Candidate"]) for r in records if r["Party"]}
-    return [r for r in records
-            if r["Party"] or (r["Electorate"], r["Candidate"]) not in with_party]
+    electorate (e.g. Mornington lists "Adrian Maher" and "Adrian Maher (Ind)"). The kept entry
+    takes the dropped one's URL if it has none of its own."""
+    with_party = {(r["Electorate"], r["Candidate"]): r for r in records if r["Party"]}
+    kept = []
+    for r in records:
+        duplicate_of = with_party.get((r["Electorate"], r["Candidate"]))
+        if r["Party"] or duplicate_of is None:
+            kept.append(r)
+        elif not duplicate_of["URL"]:
+            duplicate_of["URL"] = r["URL"]
+    return kept
 
 
 def main() -> None:
@@ -175,7 +273,7 @@ def main() -> None:
     records = parse_table(find_assembly_table(soup)) + parse_council_tables(soup)
 
     with args.output.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=["Electorate", "Candidate", "Party", "House"])
+        writer = csv.DictWriter(f, fieldnames=FIELDNAMES)
         writer.writeheader()
         writer.writerows(records)
 
