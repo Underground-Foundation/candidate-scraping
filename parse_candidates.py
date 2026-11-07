@@ -1,7 +1,8 @@
 #!/usr/bin/env python3
-"""Parse the Legislative Assembly candidates table from a saved Wikipedia page into a CSV.
+"""Parse the Legislative Assembly and Legislative Council candidate tables from a saved
+Wikipedia page into a CSV.
 
-Output has one row per candidate, with columns Electorate, Candidate, Party.
+Output has one row per candidate, with columns Electorate, Candidate, Party, House.
 """
 
 import argparse
@@ -13,7 +14,10 @@ from pathlib import Path
 from bs4 import BeautifulSoup, Tag
 
 DEFAULT_INPUT = "Candidates of the 2026 Victorian state election - Wikipedia.html"
-DEFAULT_OUTPUT = "legislative_assembly_candidates.csv"
+DEFAULT_OUTPUT = "candidates.csv"
+
+ASSEMBLY = "Legislative Assembly"
+COUNCIL = "Legislative Council"
 
 # Abbreviations used in brackets after a candidate's name, e.g. "Andrew Cook (L)".
 PARTY_ABBREVIATIONS = {
@@ -44,19 +48,42 @@ def find_assembly_table(soup: BeautifulSoup) -> Tag:
     return table
 
 
+def find_council_tables(soup: BeautifulSoup) -> list[tuple[str, Tag]]:
+    """(electorate, table) for each region section under the 'Legislative Council' heading."""
+    heading = soup.find(id="Legislative_Council")
+    if heading is None:
+        sys.exit("Could not find the 'Legislative Council' heading")
+    council = heading.find_parent("section")
+    if council is None:
+        sys.exit("Could not find the <section> containing the 'Legislative Council' heading")
+    tables = []
+    for section in council.find_all("section", recursive=False):
+        council_region = section.find("h3")
+        table = section.find("table", class_="wikitable")
+        if council_region and table:
+            tables.append((council_region.get_text(" ", strip=True), table))
+    if not tables:
+        sys.exit("Could not find any tables under the 'Legislative Council' heading")
+    return tables
+
+
 def column_party(header: Tag) -> str:
     """Party for a column header like "Labor candidate"; returns "" for mixed columns."""
-    text = header.get_text(" ", strip=True)
-    return re.sub(r"\s*candidates?$", "", text, flags=re.IGNORECASE)
+    text = header.get_text(" ", strip=True).replace("*", "")
+    party = re.sub(r"\s*candidates?$", "", text, flags=re.IGNORECASE)
+    return PARTY_ABBREVIATIONS.get(party, party)
 
 
 def cell_lines(cell: Tag) -> list[str]:
-    """Text of a cell split on <br>, with footnote markers removed."""
+    """Text of a cell split on <br> and <li>, with footnote markers and the asterisks that
+    mark successful candidates removed."""
     for sup in cell.find_all("sup"):
         sup.decompose()
     for br in cell.find_all("br"):
         br.replace_with("\n")
-    text = cell.get_text()
+    for li in cell.find_all("li"):
+        li.append("\n")
+    text = cell.get_text().replace("*", "")
     return [" ".join(line.split()) for line in text.split("\n") if line.strip()]
 
 
@@ -68,6 +95,12 @@ def resolve_party(abbreviation: str | None, default: str, electorate: str, line:
     print(f"Warning: unknown party abbreviation {abbreviation!r} in {electorate}: {line!r}",
           file=sys.stderr)
     return abbreviation
+
+
+def parse_candidate_line(line: str, default_party: str, electorate: str, house: str) -> dict:
+    match = CANDIDATE_RE.match(line)
+    party = resolve_party(match["party"], default_party, electorate, line)
+    return {"Electorate": electorate, "Candidate": match["name"], "Party": party, "House": house}
 
 
 def parse_table(table: Tag) -> list[dict]:
@@ -89,11 +122,37 @@ def parse_table(table: Tag) -> list[dict]:
             continue
         for i in candidate_columns:
             for line in cell_lines(cells[i]):
-                match = CANDIDATE_RE.match(line)
-                name = match["name"]
-                party = resolve_party(match["party"], parties[i], electorate, line)
-                records.append({"Electorate": electorate, "Candidate": name, "Party": party})
+                records.append(parse_candidate_line(line, parties[i], electorate, ASSEMBLY))
     return drop_partyless_duplicates(records)
+
+
+def parse_council_table(table: Tag, electorate: str) -> list[dict]:
+    """Parse a region's table, which repeats a pattern of three rows: party headers, colour
+    swatches, then one cell per party listing its candidates."""
+    records = []
+    parties = []
+    for row in table.find_all("tr"):
+        cells = row.find_all(["td", "th"], recursive=False)
+        if cells and all(cell.name == "th" for cell in cells):
+            parties = [column_party(cell) for cell in cells]
+            continue
+        columns = [cell_lines(cell) for cell in cells]
+        if not any(columns):  # e.g. the row of party colour swatches
+            continue
+        if len(columns) != len(parties):
+            print(f"Warning: {len(columns)} candidate cells under {len(parties)} party headers "
+                  f"in {electorate}: {parties}", file=sys.stderr)
+        for party, lines in zip(parties, columns):
+            for line in lines:
+                records.append(parse_candidate_line(line, party, electorate, COUNCIL))
+    return records
+
+
+def parse_council_tables(soup: BeautifulSoup) -> list[dict]:
+    records = []
+    for electorate, table in find_council_tables(soup):
+        records.extend(parse_council_table(table, electorate))
+    return records
 
 
 def drop_partyless_duplicates(records: list[dict]) -> list[dict]:
@@ -113,10 +172,10 @@ def main() -> None:
     args = parser.parse_args()
 
     soup = BeautifulSoup(args.input.read_text(encoding="utf-8"), "html.parser")
-    records = parse_table(find_assembly_table(soup))
+    records = parse_table(find_assembly_table(soup)) + parse_council_tables(soup)
 
     with args.output.open("w", newline="", encoding="utf-8") as f:
-        writer = csv.DictWriter(f, fieldnames=["Electorate", "Candidate", "Party"])
+        writer = csv.DictWriter(f, fieldnames=["Electorate", "Candidate", "Party", "House"])
         writer.writeheader()
         writer.writerows(records)
 

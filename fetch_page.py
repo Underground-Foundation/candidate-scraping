@@ -4,6 +4,7 @@
 import argparse
 import http.cookiejar
 import json
+import shutil
 import sys
 from pathlib import Path
 from urllib.parse import urlparse
@@ -84,6 +85,11 @@ def build_driver(user_agent: str | None, headless: bool, geckodriver: str | None
         options.add_argument("-headless")
     if user_agent:
         options.set_preference("general.useragent.override", user_agent)
+    # Prefer a geckodriver already on PATH. Passing an explicit driver path stops Selenium Manager
+    # from also choosing a browser binary, which on Ubuntu is the /usr/bin/firefox shell wrapper for
+    # the snap; geckodriver rejects that ("binary is not a Firefox executable") but finds the real
+    # Firefox itself when left to its own devices.
+    geckodriver = geckodriver or shutil.which("geckodriver")
     service = Service(executable_path=geckodriver) if geckodriver else Service()
     return webdriver.Firefox(options=options, service=service)
 
