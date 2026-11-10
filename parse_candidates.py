@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
-"""Parse the Legislative Assembly and Legislative Council candidate tables from a saved
-Wikipedia page into a CSV.
+"""Parse the Legislative Assembly and Legislative Council candidates into a CSV, from either a
+saved Wikipedia page (.html) or the VEC's candidate contact persons report (.xls).
 
 Output has one row per candidate, with columns Electorate, Candidate, Party, House, URL.
-The URL is the candidate's own link (usually their Wikipedia article) if their name is
-linked, otherwise the first web link in a footnote attached to their name, otherwise blank.
+For a Wikipedia page, the URL is the candidate's own link (usually their Wikipedia article) if
+their name is linked, otherwise the first web link in a footnote attached to their name,
+otherwise blank. The VEC report has no URLs, so that column is left blank.
 """
 
 import argparse
@@ -261,16 +262,152 @@ def drop_partyless_duplicates(records: list[dict]) -> list[dict]:
     return kept
 
 
+# VEC section headings, e.g. "Albert Park District" or "Eastern Victoria Region".
+VEC_HOUSE_SUFFIXES = {" District": ASSEMBLY, " Region": COUNCIL}
+# The line under a VEC section heading, e.g. "(1 vacancy, 7 candidates) ".
+VEC_COUNT_RE = re.compile(r"^\(\d+ vacanc(?:y|ies), (?P<count>\d+) candidates?\)$")
+VEC_COLUMN_HEADER = "Candidates"
+
+# The VEC's registered party names, mapped to the shorter names the Wikipedia page uses, so that
+# both sources produce the same Party for a candidate. A blank party (no registered party) is
+# mapped to "Independent", as on the Wikipedia page.
+VEC_PARTIES = {
+    "": "Independent",
+    "Affordable Housing Now – Sustainable Australia Party": "Sustainable",
+    "Animal Justice Party": "Animal Justice",
+    "Australian Citizens Party (Victorian Division)": "Australian Citizens Party",
+    "Australian Democrats": "Democrats",
+    "Australian Greens Victoria": "Greens",
+    "Australian Labor Party - Victorian Branch": "Labor",
+    "Christian Alliance Party – Reform AU": "Christian Alliance",
+    "Democratic Labour Party (DLP)": "Democratic Labour",
+    "Family First Victoria": "Family First",
+    "Legalise Cannabis Victoria": "Legalise Cannabis",
+    "Liberal Party of Australia - Victorian Division": "Liberal",
+    "National Party of Australia - Victoria": "National",
+    "One Nation Victoria": "One Nation",
+    "Shooters, Fishers and Farmers Party Victoria": "Shooters, Fishers and Farmers",
+    "Socialist Alliance": "Socialist Alliance",
+    "The Republican Make Australia Great Again": "Republican",
+    "The West Party": "The West Party",
+    "Victorian Socialists": "Socialists",
+}
+# VEC electorate names that the Wikipedia page spells differently.
+VEC_ELECTORATES = {
+    "North-Eastern Metropolitan": "North Eastern Metropolitan",
+    "South-Eastern Metropolitan": "South Eastern Metropolitan",
+}
+COALITION = "Coalition"
+COALITION_PARTIES = {"Liberal", "National"}
+
+
+def title_case_word(word: str) -> str:
+    """Title-case one word of a VEC surname, e.g. "SMITH" -> "Smith". The VEC keeps any
+    lowercase it was given ("McKEEMAN", "de VIETRI"), so a lowercase prefix is kept as is.
+    All-caps "MC" names become "Mc..." ("MCRAE" -> "McRae")."""
+    if word.islower():
+        return word  # e.g. the "de" of "de VIETRI"
+    prefix = re.match(r"^[a-z]*(?:[A-Z][a-z]+)?", word).group()
+    rest = word[len(prefix):]
+    if not prefix and rest.startswith("MC") and len(rest) > 2:
+        prefix, rest = "Mc", rest[2:]
+    if not prefix:
+        return rest[:1].upper() + rest[1:].lower()
+    return prefix + rest[:1].upper() + rest[1:].lower()
+
+
+def title_case_surname(surname: str) -> str:
+    """Title-case each part of a surname, splitting on spaces, hyphens and apostrophes:
+    "MATTHEWS-WARD" -> "Matthews-Ward", "O'BRIEN" -> "O'Brien", "DE SILVA" -> "De Silva"."""
+    return "".join(title_case_word(part) if part.strip(" -'’") else part
+                   for part in re.split(r"([ \-'’]+)", surname))
+
+
+def vec_candidate_name(text: str) -> str:
+    """ "SURNAME, Given Names" -> "Given Names Surname". Given names are already in mixed case
+    (and may contain deliberate capitals, such as "SM Zaberul"), so they're left alone."""
+    surname, _, given = text.partition(",")
+    return " ".join(part for part in (given.strip(), title_case_surname(surname.strip())) if part)
+
+
+def vec_party(name: str, electorate: str) -> str:
+    if name in VEC_PARTIES:
+        return VEC_PARTIES[name]
+    print(f"Warning: unknown VEC party {name!r} in {electorate}", file=sys.stderr)
+    return name
+
+
+def label_coalition_tickets(records: list[dict]) -> None:
+    """In a Legislative Council region where the Liberals and Nationals run a joint ticket (both
+    have candidates there), the Wikipedia page lists their candidates under "Coalition"."""
+    parties_by_region: dict[str, set[str]] = {}
+    for r in records:
+        if r["House"] == COUNCIL:
+            parties_by_region.setdefault(r["Electorate"], set()).add(r["Party"])
+    joint = {e for e, parties in parties_by_region.items() if COALITION_PARTIES <= parties}
+    for r in records:
+        if r["House"] == COUNCIL and r["Electorate"] in joint and r["Party"] in COALITION_PARTIES:
+            r["Party"] = COALITION
+
+
+def parse_vec_sheet(rows: list[list]) -> list[dict]:
+    """Parse the VEC report's rows. Each electorate is a heading row, a "(N vacancies, M
+    candidates)" row, a column header row, then one row per candidate, with the candidate's
+    name in the first column and their registered party (blank if none) in the last. Party and
+    electorate names are converted to the ones the Wikipedia page uses."""
+    records = []
+    electorate = house = None
+    expected: dict[str, int] = {}
+    for row in rows:
+        first = str(row[0]).strip()
+        if not first:
+            continue
+        for suffix, suffix_house in VEC_HOUSE_SUFFIXES.items():
+            if first.endswith(suffix) and not row[-1]:
+                electorate, house = first.removesuffix(suffix), suffix_house
+                electorate = VEC_ELECTORATES.get(electorate, electorate)
+                break
+        else:
+            if match := VEC_COUNT_RE.match(first):
+                expected[electorate] = int(match["count"])
+            elif electorate is not None and first != VEC_COLUMN_HEADER:
+                records.append({"Electorate": electorate, "Candidate": vec_candidate_name(first),
+                                "Party": vec_party(str(row[-1]).strip(), electorate),
+                                "House": house, "URL": ""})
+
+    found = {e: 0 for e in expected}
+    for r in records:
+        found[r["Electorate"]] = found.get(r["Electorate"], 0) + 1
+    for e in found:
+        if found[e] != expected.get(e):
+            print(f"Warning: {e} lists {expected.get(e)} candidates but {found[e]} were found",
+                  file=sys.stderr)
+    label_coalition_tickets(records)
+    return records
+
+
+def parse_vec_xls(path: Path) -> list[dict]:
+    import xlrd  # only needed for the VEC report
+    sheet = xlrd.open_workbook(path).sheet_by_index(0)
+    return parse_vec_sheet([sheet.row_values(i) for i in range(sheet.nrows)])
+
+
 def main() -> None:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("input", nargs="?", type=Path, default=Path(DEFAULT_INPUT),
-                        help="Saved HTML page (default: %(default)s)")
+                        help="Saved Wikipedia page (.html) or VEC report (.xls) (default: %(default)s)")
     parser.add_argument("-o", "--output", type=Path, default=Path(DEFAULT_OUTPUT),
                         help="CSV file to write (default: %(default)s)")
     args = parser.parse_args()
 
-    soup = BeautifulSoup(args.input.read_text(encoding="utf-8"), "html.parser")
-    records = parse_table(find_assembly_table(soup)) + parse_council_tables(soup)
+    suffix = args.input.suffix.lower()
+    if suffix in (".html", ".htm"):
+        soup = BeautifulSoup(args.input.read_text(encoding="utf-8"), "html.parser")
+        records = parse_table(find_assembly_table(soup)) + parse_council_tables(soup)
+    elif suffix == ".xls":
+        records = parse_vec_xls(args.input)
+    else:
+        sys.exit(f"This file has an unsupported format for parsing: {args.input}")
 
     with args.output.open("w", newline="", encoding="utf-8") as f:
         writer = csv.DictWriter(f, fieldnames=FIELDNAMES)

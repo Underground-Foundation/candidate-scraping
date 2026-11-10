@@ -243,3 +243,81 @@ class MainTest(unittest.TestCase):
 
 if __name__ == "__main__":
     unittest.main()
+
+
+class VecNameTest(unittest.TestCase):
+    def test_names(self):
+        cases = {
+            "SEMMENS, Sonya": "Sonya Semmens",
+            "KING, Adrian William": "Adrian William King",
+            "MCRAE, Ross": "Ross McRae",
+            "McKEEMAN, Lachie": "Lachie McKeeman",
+            "de VIETRI, Gabrielle": "Gabrielle de Vietri",
+            "O'BRIEN, Danny": "Danny O'Brien",
+            "D'ARCY, Catherine": "Catherine D'Arcy",
+            "MATTHEWS-WARD, Kathleen": "Kathleen Matthews-Ward",
+            "DE SILVA, Roshan": "Roshan De Silva",
+            "ISLAM, SM Zaberul": "SM Zaberul Islam",
+        }
+        for vec, expected in cases.items():
+            self.assertEqual(parse_candidates.vec_candidate_name(vec), expected)
+
+
+class ParseVecSheetTest(unittest.TestCase):
+    ROWS = [
+        ["Candidate Contact Persons' Details Summary Report", "", "", "", ""],
+        ["Total Candidates for ALL Electorates", 3.0, "", "", ""],
+        ["", "", "", "", ""],
+        ["Albert Park District", "", "", "", ""],
+        ["(1 vacancy, 2 candidates) ", "", "", "", ""],
+        ["Candidates", "Contact Person Name", "Phone Contact", "Email Address", "RPP Name"],
+        ["SEMMENS, Sonya", "Jess Wheelock", "", "x@example.org", "Australian Greens Victoria"],
+        ["KING, Adrian William", "Adrian King", "", "y@example.org", ""],
+        ["", "", "", "", ""],
+        ["Eastern Victoria Region", "", "", "", ""],
+        ["(5 vacancies, 1 candidates) ", "", "", "", ""],
+        ["Candidates", "Contact Person Name", "Phone Contact", "Email Address", "RPP Name"],
+        ["BATH, Melina", "Someone", "", "z@example.org", "National Party of Australia - Victoria"],
+    ]
+
+    def test_parse(self):
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            records = parse_candidates.parse_vec_sheet(self.ROWS)
+        self.assertEqual(stderr.getvalue(), "")
+        self.assertEqual([(r["Electorate"], r["Candidate"], r["Party"], r["House"]) for r in records], [
+            ("Albert Park", "Sonya Semmens", "Greens", "Legislative Assembly"),
+            ("Albert Park", "Adrian William King", "Independent", "Legislative Assembly"),
+            ("Eastern Victoria", "Melina Bath", "National", "Legislative Council"),
+        ])
+
+    def test_coalition_and_electorate_names(self):
+        rows = [
+            ["North-Eastern Metropolitan Region", "", "", "", ""],
+            ["(5 vacancies, 1 candidates) ", "", "", "", ""],
+            ["WELCH, Richard", "", "", "", "Liberal Party of Australia - Victorian Division"],
+            ["Northern Victoria Region", "", "", "", ""],
+            ["(5 vacancies, 2 candidates) ", "", "", "", ""],
+            ["BROAD, Gaelle", "", "", "", "National Party of Australia - Victoria"],
+            ["BROOKS, Steve", "", "", "", "Liberal Party of Australia - Victorian Division"],
+        ]
+        records = parse_candidates.parse_vec_sheet(rows)
+        self.assertEqual([(r["Electorate"], r["Party"]) for r in records], [
+            ("North Eastern Metropolitan", "Liberal"),
+            ("Northern Victoria", "Coalition"),
+            ("Northern Victoria", "Coalition"),
+        ])
+
+    def test_warns_on_unknown_party(self):
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            records = parse_candidates.parse_vec_sheet(
+                self.ROWS[3:6] + [["SMITH, Jo", "", "", "", "New Party"], self.ROWS[7]])
+        self.assertEqual(records[0]["Party"], "New Party")
+        self.assertIn("unknown VEC party 'New Party'", stderr.getvalue())
+
+    def test_warns_on_count_mismatch(self):
+        stderr = io.StringIO()
+        with contextlib.redirect_stderr(stderr):
+            parse_candidates.parse_vec_sheet(self.ROWS[:7])
+        self.assertIn("Albert Park lists 2 candidates but 1 were found", stderr.getvalue())
