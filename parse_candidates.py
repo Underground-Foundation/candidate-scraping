@@ -291,6 +291,20 @@ VEC_PARTIES = {
     "The Republican Make Australia Great Again": "Republican",
     "The West Party": "The West Party",
     "Victorian Socialists": "Socialists",
+    # The shorter names printed on the ballot paper, which the VEC's nominations web pages use.
+    "Australian Labor Party": "Labor",
+    "Citizens Party": "Australian Citizens Party",
+    "Climate Action Now": "Climate Action Now",
+    "Family First": "Family First",
+    "Free Palestine": "Free Palestine",
+    "I'm Voting to Avoid the Fine": "I'm Voting to Avoid the Fine",
+    "Labour DLP": "Democratic Labour",
+    "Liberal": "Liberal",
+    "Libertarian (formerly Liberal Democrats)": "Libertarian",
+    "Safety Victoria – Violent Crime Prevention": "Safety Victoria – Violent Crime Prevention",
+    "The Greens": "Greens",
+    "The Nationals": "National",
+    "The Republican": "Republican",
 }
 # VEC electorate names that the Wikipedia page spells differently.
 VEC_ELECTORATES = {
